@@ -1,0 +1,8 @@
+[Unit]
+Description=VPS Workspace - issue worker (implements labelled issues, opens PRs)
+
+[Service]
+Type=oneshot
+ExecStart=__WS_BIN__ work --due
+TimeoutStartSec=6h
+Nice=10

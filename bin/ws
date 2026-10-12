@@ -1,0 +1,675 @@
+#!/usr/bin/env bash
+# ws — VPS Workspace control CLI.  Run `ws help`.
+set -euo pipefail
+
+# ---------------------------------------------------------------- paths ----
+WS_ROOT="${WS_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+HUB="${WS_HUB:-$HOME/hub}"
+PROJECTS="${WS_PROJECTS:-$HOME/projects}"
+STATE="${WS_STATE:-$HOME/.local/state/ws}"
+LOGS="$STATE/logs"
+TMUX_SOCK="ws"
+WS_BIN="$WS_ROOT/bin/ws"
+
+export PATH="$HOME/.local/bin:$PATH"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+# nvm-managed node (if installed) so projects' npm/node work inside sessions & workers
+if [ -s "$HOME/.nvm/nvm.sh" ] && ! command -v node >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1 || true
+fi
+
+# --------------------------------------------------------------- output ----
+if [ -t 1 ]; then B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; D=$'\033[2m'; N=$'\033[0m'
+else B=; G=; Y=; R=; D=; N=; fi
+info() { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s!%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+# -------------------------------------------------------------- helpers ----
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+valid_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,39}$ ]] && [ "$1" != "hub" ]; }
+pdir()  { echo "$HUB/projects/$1"; }
+pjson() { echo "$HUB/projects/$1/project.json"; }
+exists() { [ -f "$(pjson "$1")" ]; }
+require_project() { exists "$1" || die "unknown project '$1' (see: ws list)"; }
+project_names() { [ -d "$HUB/projects" ] || return 0; for f in "$HUB"/projects/*/project.json; do [ -f "$f" ] && basename "$(dirname "$f")"; done; return 0; }
+wsjson() { echo "$HUB/workspace.json"; }
+
+# jq read with workspace defaults as fallback:  cfg <project> '.remote_control.spawn'
+cfg() {
+  local name="$1" path="$2" v
+  v="$(jq -r "$path // empty" "$(pjson "$name")" 2>/dev/null || true)"
+  if [ -z "$v" ] && [ -f "$(wsjson)" ]; then
+    v="$(jq -r ".defaults$path // empty" "$(wsjson)" 2>/dev/null || true)"
+  fi
+  printf '%s' "$v"
+}
+wcfg() { jq -r "$1 // empty" "$(wsjson)" 2>/dev/null || true; }
+
+checkout_dir() { echo "$PROJECTS/$1"; }
+
+# turn "a.b.c" into a jq path array
+jq_path() { jq -cn --arg p "$1" '$p | split(".") | map(if test("^[0-9]+$") then tonumber else . end)'; }
+
+json_set() { # file dotted.key raw-value
+  local file="$1" key="$2" raw="$3" val tmp
+  if val="$(jq -cn --argjson v "$raw" '$v' 2>/dev/null)"; then :; else val="$(jq -cn --arg v "$raw" '$v')"; fi
+  tmp="$(mktemp)"
+  jq --argjson p "$(jq_path "$key")" --argjson v "$val" 'setpath($p; $v)' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+json_unset() {
+  local file="$1" key="$2" tmp; tmp="$(mktemp)"
+  jq --argjson p "$(jq_path "$key")" 'delpaths([$p])' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+claude_logged_in() { command -v claude >/dev/null 2>&1 && timeout 20 claude auth status >/dev/null 2>&1; }
+gh_logged_in()     { command -v gh >/dev/null 2>&1 && timeout 20 gh auth status >/dev/null 2>&1; }
+have_systemd_user(){ command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; }
+
+# Mark a directory as trusted for Claude Code so background sessions don't stop
+# at the "Trust this folder?" prompt. Best effort: if the format ever changes,
+# you'll just get the prompt once in `ws attach <name>`.
+trust_dir() {
+  local dir="$1" f="$HOME/.claude.json" tmp
+  [ -f "$f" ] || echo '{}' > "$f"
+  tmp="$(mktemp)"
+  if jq --arg p "$dir" '.projects[$p] = ((.projects[$p] // {}) + {hasTrustDialogAccepted: true})' "$f" > "$tmp" 2>/dev/null; then
+    cat "$tmp" > "$f"; rm -f "$tmp"
+  else rm -f "$tmp"; warn "could not pre-trust $dir (you'll be asked once on first start)"; fi
+}
+
+hub_commit() { # message
+  [ -d "$HUB/.git" ] || return 0
+  git -C "$HUB" add -A >/dev/null 2>&1 || true
+  git -C "$HUB" diff --cached --quiet 2>/dev/null || git -C "$HUB" commit -qm "$1" >/dev/null 2>&1 || true
+}
+
+# ----------------------------------------------------------------- tmux ----
+t() { tmux -L "$TMUX_SOCK" "$@"; }
+server_running() { t list-sessions >/dev/null 2>&1; }
+session_running() { t has-session -t "=rc-$1" 2>/dev/null; }
+
+# The tmux server must live inside the ws-up systemd service so sessions survive
+# SSH logouts and timer runs. Outside that service we ask systemd to (re)start it.
+ensure_server() {
+  server_running && return 0
+  if [ "${WS_IN_SERVICE:-}" = "1" ]; then
+    t new-session -d -s _ws "sleep infinity"; return 0
+  fi
+  if have_systemd_user && systemctl --user cat ws-up.service >/dev/null 2>&1; then
+    systemctl --user restart ws-up.service
+    for _ in 1 2 3 4 5 6 7 8 9 10; do server_running && return 0; sleep 0.5; done
+  fi
+  warn "systemd user service unavailable; starting tmux directly (sessions die if this shell's session ends)"
+  t new-session -d -s _ws "sleep infinity"
+}
+
+# ------------------------------------------------------------- commands ----
+usage() {
+  cat <<EOF
+${B}ws${N} — VPS Workspace
+
+${B}Projects${N}
+  ws add <git-url|owner/repo> [name] [--branch B] [--no-start]   clone + register + start session
+  ws list                         list projects
+  ws status [--brief]             health + what's running
+  ws show <name>                  print a project's config
+  ws set <name> <key> <value>     change config, e.g.  ws set shop worker.auto_issues true
+  ws unset <name> <key>
+  ws set-default <key> <value>    change a workspace-wide default (workspace.json .defaults)
+  ws context <name>               print the context injected into that project's sessions
+  ws remove <name> [--purge]      stop + archive (and delete checkout with --purge)
+
+${B}Remote Control sessions${N}  (show up in the Claude app → Code)
+  ws up [name|hub|--all]          start (default: --all)
+  ws down <name|hub|--all>        stop
+  ws restart <name|hub>           restart (picks up config changes)
+  ws attach <name|hub>            open the live terminal (detach: Ctrl-b d)
+  ws logs <name|hub> [-f]         show output
+
+${B}Automation${N}
+  ws work <name>                  implement the oldest open issue labelled 'claude' and open a PR
+  ws work --due                   run the worker for every project whose interval has elapsed
+  ws sync                         commit the Hub and push it (if a remote is set)
+  ws hub-remote <git-url>         back the Hub up to a (private!) GitHub repo
+
+${B}Setup${N}
+  ws init                         first-time setup / repair (safe to re-run)
+  ws apply                        re-apply global CLAUDE.md, settings, skills, services
+  ws doctor                       diagnose problems
+  ws self-update                  pull the latest workspace tooling
+EOF
+}
+
+# ---- init / apply ----------------------------------------------------------
+cmd_init() {
+  local interactive=1; [ "${1:-}" = "--non-interactive" ] && interactive=0
+  need git; need jq; need tmux
+  mkdir -p "$PROJECTS" "$LOGS" "$STATE/work" "$HOME/.claude/skills"
+
+  if [ ! -d "$HUB" ]; then
+    info "Creating the Hub at $HUB"
+    cp -a "$WS_ROOT/hub-template" "$HUB"
+    mkdir -p "$HUB/global/skills" "$HUB/projects" "$HUB/archive"
+    cp "$WS_ROOT/claude/CLAUDE.md" "$HUB/global/CLAUDE.md"
+    cp "$WS_ROOT/claude/settings.json" "$HUB/global/settings.json"
+    touch "$HUB/global/skills/.gitkeep" "$HUB/archive/.gitkeep"
+    git -C "$HUB" init -q -b main
+    hub_commit "hub: initial"
+  fi
+  [ -f "$(wsjson)" ] || cp "$WS_ROOT/hub-template/workspace.json" "$(wsjson)"
+
+  # git identity for commits Claude makes
+  if [ -z "$(git config --global user.name || true)" ]; then
+    local gname="" gemail=""
+    if gh_logged_in; then
+      gname="$(gh api user --jq '.name // .login' 2>/dev/null || true)"
+      local gid glogin; gid="$(gh api user --jq .id 2>/dev/null || true)"; glogin="$(gh api user --jq .login 2>/dev/null || true)"
+      [ -n "$gid" ] && gemail="${gid}+${glogin}@users.noreply.github.com"
+    fi
+    if [ $interactive = 1 ] && [ -t 0 ]; then
+      read -r -p "Git author name for Claude's commits [${gname:-Claude (VPS)}]: " a || true; gname="${a:-${gname:-Claude (VPS)}}"
+      read -r -p "Git author email [${gemail:-claude@localhost}]: " a || true; gemail="${a:-${gemail:-claude@localhost}}"
+    fi
+    if [ -n "$gname" ] && [ -n "$gemail" ]; then
+      git config --global user.name "$gname"; git config --global user.email "$gemail"
+      ok "git identity: $gname <$gemail>"
+    fi
+  fi
+  git config --global init.defaultBranch main
+  git config --global pull.rebase true
+  git config --global push.autoSetupRemote true
+
+  trust_dir "$HUB"
+  cmd_apply
+
+  echo
+  local ready=1
+  if claude_logged_in; then ok "Claude is logged in"; else ready=0; warn "Claude is not logged in → run: claude   then  /login"; fi
+  if gh_logged_in; then ok "GitHub CLI is logged in"; gh auth setup-git >/dev/null 2>&1 || true
+  else ready=0; warn "GitHub is not logged in → run: gh auth login   then  gh auth setup-git"; fi
+  if [ $ready = 1 ]; then
+    cmd_up --all
+    echo
+    info "${B}Next:${N} run ${B}ws attach hub${N} once and answer the one-time prompts (Enable Remote Control → y)."
+    info "Then open the Claude app → Code and pick the session \"$(wcfg .hub_title || echo 'Workspace Hub')\"."
+  fi
+}
+
+cmd_apply() {
+  [ -d "$HUB" ] || die "no Hub yet — run: ws init"
+  mkdir -p "$HOME/.claude/skills"
+  # global CLAUDE.md is a live link to the Hub copy (edit it from the Hub session)
+  ln -sfn "$HUB/global/CLAUDE.md" "$HOME/.claude/CLAUDE.md"
+  # settings are copied (Claude Code rewrites this file; a symlink could be replaced)
+  if [ -f "$HOME/.claude/settings.json" ] && ! cmp -s "$HUB/global/settings.json" "$HOME/.claude/settings.json"; then
+    cp "$HOME/.claude/settings.json" "$STATE/settings.json.bak.$(date +%s)"
+  fi
+  # shellcheck disable=SC2016
+  sed "s#__WS_BIN__#$WS_BIN#g" "$HUB/global/settings.json" > "$HOME/.claude/settings.json"
+  # skills: tooling skills + your own skills from the Hub
+  local d
+  for d in "$WS_ROOT"/claude/skills/*/ "$HUB"/global/skills/*/; do
+    [ -f "$d/SKILL.md" ] || continue
+    ln -sfn "${d%/}" "$HOME/.claude/skills/$(basename "$d")"
+  done
+  # drop dangling skill links (skill deleted from the Hub)
+  for d in "$HOME"/.claude/skills/*; do [ -L "$d" ] && [ ! -e "$d" ] && rm -f "$d"; done
+  ok "applied global CLAUDE.md, settings and skills"
+
+  if have_systemd_user; then
+    mkdir -p "$HOME/.config/systemd/user"
+    local u
+    for u in "$WS_ROOT"/systemd/*; do
+      sed "s#__WS_BIN__#$WS_BIN#g" "$u" > "$HOME/.config/systemd/user/$(basename "$u")"
+    done
+    systemctl --user daemon-reload
+    systemctl --user enable ws-up.service ws-tick.timer ws-work.timer >/dev/null 2>&1 || true
+    systemctl --user start ws-tick.timer ws-work.timer >/dev/null 2>&1 || true
+    ok "background services installed (ws-up, ws-tick timer, ws-work timer)"
+  else
+    warn "systemd user instance not reachable (is lingering enabled? sudo loginctl enable-linger $(id -un))"
+  fi
+}
+
+# ---- add / remove -----------------------------------------------------------
+detect_commands() { # dir -> json object
+  local dir="$1" setup="" test="" lint="" build=""
+  if [ -f "$dir/package.json" ]; then
+    local pm="npm"
+    [ -f "$dir/pnpm-lock.yaml" ] && pm="pnpm"; [ -f "$dir/yarn.lock" ] && pm="yarn"
+    case $pm in
+      pnpm) setup="pnpm install --frozen-lockfile";;
+      yarn) setup="yarn install --frozen-lockfile";;
+      npm)  if [ -f "$dir/package-lock.json" ]; then setup="npm ci"; else setup="npm install"; fi;;
+    esac
+    jq -e '.scripts.test'  "$dir/package.json" >/dev/null 2>&1 && test="$pm test"
+    jq -e '.scripts.lint'  "$dir/package.json" >/dev/null 2>&1 && lint="$pm run lint"
+    jq -e '.scripts.build' "$dir/package.json" >/dev/null 2>&1 && build="$pm run build"
+    if [ -z "$lint" ] && jq -e '.scripts.typecheck' "$dir/package.json" >/dev/null 2>&1; then lint="$pm run typecheck"; fi
+  elif [ -f "$dir/pyproject.toml" ] || [ -f "$dir/requirements.txt" ]; then
+    if [ -f "$dir/requirements.txt" ]; then setup="python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+    else setup="python3 -m venv .venv && .venv/bin/pip install -e '.[dev]' || .venv/bin/pip install -e ."; fi
+    if grep -rqs pytest "$dir/pyproject.toml" "$dir/requirements.txt" "$dir"/requirements*.txt || [ -d "$dir/tests" ]; then test=".venv/bin/python -m pytest -q"; fi
+    grep -qs ruff "$dir/pyproject.toml" && lint=".venv/bin/ruff check ."
+  elif [ -f "$dir/composer.json" ]; then
+    setup="composer install"
+    [ -f "$dir/phpunit.xml" ] || [ -f "$dir/phpunit.xml.dist" ] && test="vendor/bin/phpunit"
+  elif [ -f "$dir/go.mod" ]; then
+    test="go test ./..."; lint="go vet ./..."; build="go build ./..."
+  elif [ -f "$dir/Cargo.toml" ]; then
+    test="cargo test"; lint="cargo clippy -- -D warnings"; build="cargo build"
+  fi
+  if [ -z "$test" ] && [ -f "$dir/Makefile" ] && grep -qE '^test:' "$dir/Makefile"; then test="make test"; fi
+  if [ -z "$lint" ] && [ -f "$dir/Makefile" ] && grep -qE '^lint:' "$dir/Makefile"; then lint="make lint"; fi
+  jq -cn --arg s "$setup" --arg t "$test" --arg l "$lint" --arg b "$build" '{setup:$s,test:$t,lint:$l,build:$b}'
+}
+
+cmd_add() {
+  local url="" name="" branch="" start=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch) branch="$2"; shift 2;;
+      --no-start) start=0; shift;;
+      -*) die "unknown flag $1";;
+      *) if [ -z "$url" ]; then url="$1"; elif [ -z "$name" ]; then name="$1"; else die "too many arguments"; fi; shift;;
+    esac
+  done
+  [ -n "$url" ] || die "usage: ws add <git-url|owner/repo> [name]"
+  [ -d "$HUB" ] || die "no Hub yet — run: ws init"
+  [[ "$url" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && url="https://github.com/$url.git"
+  if [ -z "$name" ]; then name="$(basename "${url%.git}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_\n-' '-')"; fi
+  valid_name "$name" || die "invalid project name '$name' (lowercase letters, digits, - and _; not 'hub')"
+  exists "$name" && die "project '$name' already exists"
+
+  local dir; dir="$(checkout_dir "$name")"
+  if [ -d "$dir/.git" ]; then info "Using existing checkout $dir"
+  else info "Cloning $url → $dir"; git clone -q ${branch:+--branch "$branch"} "$url" "$dir"; fi
+  if [ -z "$branch" ]; then
+    branch="$(git -C "$dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
+    [ -n "$branch" ] || branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+  fi
+  local repo_slug=""
+  local origin_url; origin_url="$(git -C "$dir" remote get-url origin)"
+  if [[ "$origin_url" =~ github\.com[:/]([^/]+/[^/]+)$ ]]; then repo_slug="${BASH_REMATCH[1]%.git}"; fi
+
+  local p; p="$(pdir "$name")"; mkdir -p "$p"
+  jq -n --arg name "$name" --arg url "$url" --arg slug "$repo_slug" --arg br "$branch" \
+        --argjson cmds "$(detect_commands "$dir")" '
+  { name: $name,
+    repo: $url,
+    github: $slug,
+    default_branch: $br,
+    enabled: true,
+    remote_control: {},
+    commands: $cmds,
+    worker: { auto_issues: false },
+    pr: { draft: false, reviewers: [] }
+  }' > "$p/project.json"
+  [ -f "$p/CONTEXT.md" ] || sed "s#__NAME__#$name#g; s#__REPO__#${repo_slug:-$url}#g" "$WS_ROOT/templates/project/CONTEXT.md" > "$p/CONTEXT.md"
+  [ -f "$p/NOTES.md" ]   || sed "s#__NAME__#$name#g" "$WS_ROOT/templates/project/NOTES.md" > "$p/NOTES.md"
+  trust_dir "$dir"
+  hub_commit "add project $name"
+  ok "registered '$name' (config: $p/project.json)"
+  info "  detected commands: $(jq -c '.commands | with_entries(select(.value != ""))' "$p/project.json")"
+  [ $start = 1 ] && cmd_up "$name"
+  return 0
+}
+
+cmd_remove() {
+  local name="${1:-}" purge=0; [ "${2:-}" = "--purge" ] && purge=1
+  require_project "$name"
+  cmd_down "$name" || true
+  mkdir -p "$HUB/archive"
+  rm -rf "$HUB/archive/$name"; mv "$(pdir "$name")" "$HUB/archive/$name"
+  hub_commit "archive project $name"
+  ok "archived Hub data to $HUB/archive/$name"
+  if [ $purge = 1 ]; then rm -rf "$(checkout_dir "$name")"; ok "deleted checkout"; fi
+}
+
+# ---- config -----------------------------------------------------------------
+cmd_list() {
+  local n
+  for n in $(project_names); do
+    printf '%-20s %-8s %-10s %s\n' "$n" \
+      "$(session_running "$n" && echo "${G}running${N}" || echo "${D}stopped${N}")" \
+      "$( [ "$(cfg "$n" .worker.auto_issues)" = "true" ] && echo "auto-PR" || echo "-")" \
+      "$(jq -r '.github // .repo' "$(pjson "$n")")"
+  done
+}
+cmd_show() { require_project "${1:-}"; jq . "$(pjson "$1")"; }
+cmd_set() {
+  [ $# -ge 3 ] || die "usage: ws set <name> <key.path> <value>"
+  require_project "$1"; local name="$1" key="$2"; shift 2
+  json_set "$(pjson "$name")" "$key" "$*"
+  hub_commit "config($name): $key=$*"
+  ok "$name: $key = $(jq -c --argjson p "$(jq_path "$key")" 'getpath($p)' "$(pjson "$name")")"
+  case "$key" in remote_control*|enabled) info "  restart to apply: ws restart $name";; esac
+}
+cmd_unset() { require_project "$1"; json_unset "$(pjson "$1")" "$2"; hub_commit "config($1): unset $2"; ok "unset $1 $2"; }
+cmd_set_default() {
+  [ $# -ge 2 ] || die "usage: ws set-default <key.path> <value>"
+  local key="$1"; shift
+  json_set "$(wsjson)" "defaults.$key" "$*"; hub_commit "defaults: $key=$*"; ok "default $key = $*"
+}
+
+# ---- Remote Control sessions ---------------------------------------------------
+rc_target_dir() { if [ "$1" = hub ]; then echo "$HUB"; else checkout_dir "$1"; fi; }
+
+cmd_up() {
+  local target="${1:---all}" n
+  if [ "$target" = "--all" ]; then
+    ensure_server
+    [ "$(wcfg .hub_enabled)" = "false" ] || start_rc hub
+    for n in $(project_names); do
+      [ "$(jq -r '.enabled' "$(pjson "$n")")" = "false" ] && continue
+      start_rc "$n"
+    done
+  else
+    [ "$target" = hub ] || require_project "$target"
+    ensure_server; start_rc "$target"
+  fi
+}
+
+start_rc() {
+  local name="$1" dir; dir="$(rc_target_dir "$name")"
+  [ -d "$dir" ] || { warn "$name: checkout missing at $dir"; return 0; }
+  if session_running "$name"; then [ "${QUIET:-}" = 1 ] || info "$name: already running"; return 0; fi
+  mkdir -p "$LOGS"
+  t new-session -d -s "rc-$name" -c "$dir" -x 200 -y 50 "$WS_BIN _rc-loop $name"
+  t pipe-pane -o -t "rc-$name" "cat >> '$LOGS/$name.log'"
+  ok "$name: Remote Control session started"
+}
+
+cmd_down() {
+  local target="${1:-}" n
+  [ -n "$target" ] || die "usage: ws down <name|hub|--all>"
+  if [ "$target" = "--all" ]; then
+    for n in hub $(project_names); do session_running "$n" && t kill-session -t "=rc-$n" && ok "$n stopped"; done
+    return 0
+  fi
+  if session_running "$target"; then t kill-session -t "=rc-$target"; ok "$target stopped"; else info "$target: not running"; fi
+}
+cmd_restart() { cmd_down "$1" >/dev/null || true; sleep 1; cmd_up "$1"; }
+cmd_attach() { local n="${1:-hub}"; session_running "$n" || die "$n is not running (ws up $n)"; exec tmux -L "$TMUX_SOCK" attach -t "=rc-$n"; }
+cmd_logs() {
+  local n="${1:-hub}" f="$LOGS/${1:-hub}.log"; [ -f "$f" ] || die "no logs for $n yet"
+  if [ "${2:-}" = "-f" ]; then tail -n 50 -f "$f"; else tail -n 120 "$f"; fi
+}
+
+# Runs inside tmux: keeps `claude remote-control` alive, re-reading config each time.
+cmd_rc_loop() {
+  local name="$1"
+  while true; do
+    local dir title spawn cap mode extra=()
+    dir="$(rc_target_dir "$name")"; cd "$dir" || { echo "missing $dir"; sleep 60; continue; }
+    if [ "$name" = hub ]; then
+      title="$(wcfg .hub_title)"; title="${title:-Workspace Hub}"
+      spawn="same-dir"; cap="$(wcfg .hub_capacity)"; cap="${cap:-4}"
+      mode="$(wcfg .hub_permission_mode)"; mode="${mode:-acceptEdits}"
+    else
+      title="$(cfg "$name" .remote_control.title)"; title="${title:-$name}"
+      spawn="$(cfg "$name" .remote_control.spawn)"; spawn="${spawn:-worktree}"
+      cap="$(cfg "$name" .remote_control.capacity)"; cap="${cap:-4}"
+      mode="$(cfg "$name" .remote_control.permission_mode)"; mode="${mode:-acceptEdits}"
+      local m; m="$(cfg "$name" .remote_control.model)"; [ -n "$m" ] && extra+=(--model "$m")
+      # keep the main checkout fresh so new worktrees start from the latest default branch
+      git fetch -q origin 2>/dev/null || true
+    fi
+    if ! claude_logged_in; then
+      echo "[ws $(date '+%F %T')] Claude is not logged in. Run 'claude' then '/login' as $(id -un). Retrying in 60s."
+      sleep 60; continue
+    fi
+    echo "[ws $(date '+%F %T')] starting: claude remote-control --name '$title' --spawn $spawn --capacity $cap --permission-mode $mode ${extra[*]:-}"
+    claude remote-control --name "$title" --spawn "$spawn" --capacity "$cap" --permission-mode "$mode" "${extra[@]}" || true
+    echo "[ws $(date '+%F %T')] remote-control exited; restarting in 15s (Ctrl-C twice to stop)"
+    sleep 15
+  done
+}
+
+# ---- status / doctor ---------------------------------------------------------
+cmd_status() {
+  if [ "${1:-}" = "--brief" ]; then
+    local running=0 total=0 n
+    for n in hub $(project_names); do total=$((total+1)); session_running "$n" && running=$((running+1)); done
+    printf '[ws] %d/%d sessions running' "$running" "$total"
+    claude_logged_in || printf ' · %sClaude NOT logged in%s' "$Y" "$N"
+    gh_logged_in || printf ' · %sGitHub NOT logged in%s' "$Y" "$N"
+    printf '\n'; return 0
+  fi
+  info "${B}Hub${N}       $HUB   $(session_running hub && echo "${G}running${N}" || echo "${D}stopped${N}")"
+  info "${B}Projects${N}"; cmd_list | sed 's/^/  /'
+  echo
+  claude_logged_in && ok "Claude logged in" || warn "Claude not logged in (claude → /login)"
+  gh_logged_in && ok "GitHub logged in" || warn "GitHub not logged in (gh auth login)"
+  if have_systemd_user; then
+    systemctl --user is-active -q ws-up.service && ok "ws-up service active" || warn "ws-up service inactive"
+    systemctl --user is-active -q ws-work.timer && ok "worker timer active" || warn "worker timer inactive"
+  fi
+  if [ -d "$HUB/.git" ]; then
+    local r; r="$(git -C "$HUB" remote get-url origin 2>/dev/null || true)"
+    [ -n "$r" ] && ok "Hub backed up to $r" || warn "Hub has no backup remote (ws hub-remote <url>)"
+  fi
+}
+
+cmd_doctor() {
+  local c
+  for c in git jq tmux gh claude node; do command -v $c >/dev/null 2>&1 && ok "$c: $(command -v $c)" || warn "$c not found"; done
+  claude --version 2>/dev/null | sed 's/^/  /' || true
+  [ -n "$(git config --global user.email || true)" ] && ok "git identity set" || warn "git identity missing (git config --global user.name/email)"
+  loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q yes && ok "lingering enabled" || warn "lingering off → sudo loginctl enable-linger $(id -un)"
+  if id -nG | grep -qwE 'sudo|admin'; then warn "this user can sudo — not isolated from your websites"; else ok "no sudo (isolated)"; fi
+  cmd_status
+  info "\nMemory cap: $(systemctl show "user-$(id -u).slice" -p MemoryMax --value 2>/dev/null || echo '?')  ·  disk free: $(df -h "$HOME" | awk 'NR==2{print $4}')"
+}
+
+# ---- Hub sync -----------------------------------------------------------------
+cmd_sync() {
+  [ -d "$HUB/.git" ] || return 0
+  hub_commit "hub: sync $(date '+%F %T')"
+  if git -C "$HUB" remote get-url origin >/dev/null 2>&1; then
+    git -C "$HUB" pull -q --rebase origin main >/dev/null 2>&1 || true
+    git -C "$HUB" push -q origin HEAD:main >/dev/null 2>&1 || { [ "${QUIET:-}" = 1 ] || warn "hub push failed"; return 0; }
+    [ "${QUIET:-}" = 1 ] || ok "hub pushed"
+  fi
+}
+cmd_hub_remote() {
+  local url="${1:-}"; [ -n "$url" ] || die "usage: ws hub-remote <git-url>  (use a PRIVATE repo)"
+  [[ "$url" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && url="https://github.com/$url.git"
+  if git -C "$HUB" remote get-url origin >/dev/null 2>&1; then git -C "$HUB" remote set-url origin "$url"; else git -C "$HUB" remote add origin "$url"; fi
+  hub_commit "hub: sync"; git -C "$HUB" push -u origin HEAD:main && ok "Hub now backs up to $url"
+}
+
+# ---- issue worker --------------------------------------------------------------
+worker_allowed_tools() { # name -> comma-separated --allowedTools
+  local name="$1" t=() c
+  t+=("Read" "Edit" "Write" "Glob" "Grep" "TodoWrite"
+      "Bash(git *)" "Bash(ls *)" "Bash(mkdir *)" "Bash(cat *)" "Bash(head *)" "Bash(tail *)" "Bash(wc *)" "Bash(diff *)"
+      "Bash(npm *)" "Bash(npx *)" "Bash(pnpm *)" "Bash(yarn *)" "Bash(node *)"
+      "Bash(python3 *)" "Bash(python *)" "Bash(.venv/bin/*)" "Bash(pytest *)" "Bash(pip *)"
+      "Bash(make *)" "Bash(go *)" "Bash(cargo *)" "Bash(composer *)" "Bash(php *)")
+  for c in setup test lint build; do
+    local v; v="$(cfg "$name" ".commands.$c")"; [ -n "$v" ] && t+=("Bash($v)" "Bash($v *)")
+  done
+  while IFS= read -r c; do [ -n "$c" ] && t+=("$c"); done < <(jq -r '.worker.allow // [] | .[]' "$(pjson "$name")")
+  local IFS=,; echo "${t[*]}"
+}
+
+work_one() {
+  local name="$1" dir label base slug issue n title body branch wt out summary
+  require_project "$name"
+  gh_logged_in || die "gh not logged in"
+  dir="$(checkout_dir "$name")"; label="$(cfg "$name" .worker.label)"; label="${label:-claude}"
+  base="$(jq -r .default_branch "$(pjson "$name")")"; slug="$(jq -r '.github // empty' "$(pjson "$name")")"
+  [ -n "$slug" ] || die "$name: not a GitHub repo"
+  git -C "$dir" fetch -q origin
+
+  issue="$(gh issue list -R "$slug" --label "$label" --state open --json number,title,body,labels --limit 30 \
+    | jq -c '[.[] | select([.labels[].name] | (index("claude-wip") or index("claude-pr")) | not)] | sort_by(.number) | .[0] // empty')"
+  [ -n "$issue" ] || { [ "${QUIET:-}" = 1 ] || info "$name: no open issues labelled '$label'"; return 0; }
+  n="$(jq -r .number <<<"$issue")"; title="$(jq -r .title <<<"$issue")"; body="$(jq -r '.body // ""' <<<"$issue")"
+  info "$name: working on #$n — $title"
+
+  gh label create claude-wip -R "$slug" -c FBCA04 -d "Claude is working on this" >/dev/null 2>&1 || true
+  gh label create claude-pr  -R "$slug" -c 0E8A16 -d "Claude opened a PR"        >/dev/null 2>&1 || true
+  gh issue edit "$n" -R "$slug" --add-label claude-wip >/dev/null
+
+  branch="claude/issue-$n"; wt="$STATE/worktrees/$name-$n"
+  rm -rf "$wt"; git -C "$dir" worktree prune
+  git -C "$dir" worktree add -q -B "$branch" "$wt" "origin/$base"
+  trust_dir "$wt"
+  local setup; setup="$(cfg "$name" .commands.setup)"
+  [ -n "$setup" ] && (cd "$wt" && bash -lc "$setup" >"$STATE/work/$name-$n.setup.log" 2>&1) || true
+
+  local checks=""; local c v
+  for c in lint test build; do v="$(cfg "$name" ".commands.$c")"; [ -n "$v" ] && checks+="- $c: \`$v\`"$'\n'; done
+  local prompt
+  prompt="$(cat <<EOF
+You are implementing GitHub issue #$n in $slug, unattended. Nobody can answer questions — make sensible decisions and note assumptions.
+
+## Issue #$n: $title
+$body
+
+## Rules
+- You are already on branch \`$branch\` (based on origin/$base) in a fresh worktree. Stay on it.
+- Make the smallest complete change that resolves the issue. Follow the conventions in CLAUDE.md and the project context.
+- Add or update tests for the behaviour you change.
+- Run these checks and fix failures before finishing:
+${checks:-"- (no checks configured — at least make sure the code builds/imports)"}
+- Commit your work with clear conventional commit messages (\`git add\` + \`git commit\`). Do NOT push and do NOT open a PR; the harness does that.
+- If the issue is unclear or impossible, commit nothing and explain why.
+
+Finish with a short PR description in Markdown: **Summary**, **Changes**, **Checks run** (with results), **Assumptions/risks**.
+EOF
+)"
+  out="$STATE/work/$name-$n.json"
+  local mt; mt="$(cfg "$name" .worker.max_turns)"; mt="${mt:-80}"
+  local model; model="$(cfg "$name" .worker.model)"
+  local tmo; tmo="$(cfg "$name" .worker.timeout_minutes)"; tmo="${tmo:-60}"
+  ( cd "$wt" && timeout "${tmo}m" claude -p "$prompt" \
+      --permission-mode dontAsk \
+      --allowedTools "$(worker_allowed_tools "$name")" \
+      --disallowedTools "Bash(git push *),Bash(git push),Bash(gh *),Bash(sudo *),Bash(curl *),Bash(wget *)" \
+      --max-turns "$mt" ${model:+--model "$model"} \
+      --output-format json ) > "$out" 2>"$out.err" || true
+  summary="$(jq -r '.result // empty' "$out" 2>/dev/null || true)"
+  [ -n "$summary" ] || summary="(no summary — see $out.err on the VPS)"
+
+  local ahead; ahead="$(git -C "$wt" rev-list --count "origin/$base..HEAD" 2>/dev/null || echo 0)"
+  if [ "$ahead" -gt 0 ]; then
+    git -C "$wt" push -q -f -u origin "$branch"
+    local draft=(); [ "$(cfg "$name" .pr.draft)" = "true" ] && draft=(--draft)
+    local reviewers; reviewers="$(jq -r '.pr.reviewers // [] | join(",")' "$(pjson "$name")")"
+    local url
+    url="$(gh pr create -R "$slug" --base "$base" --head "$branch" --title "$title" "${draft[@]}" ${reviewers:+--reviewer "$reviewers"} \
+      --body "$(printf 'Closes #%s\n\n%s\n\n---\n🤖 Generated with [Claude Code](https://claude.com/claude-code) by the VPS Workspace issue worker' "$n" "$summary")" 2>&1 || true)"
+    gh issue edit "$n" -R "$slug" --remove-label claude-wip --add-label claude-pr >/dev/null || true
+    ok "$name #$n → $url"
+    printf -- '- %s worker: issue #%s → %s\n' "$(date +%F)" "$n" "$url" >> "$(pdir "$name")/NOTES.md"
+  else
+    gh issue comment "$n" -R "$slug" --body "$(printf '🤖 I picked this up on the VPS but did not produce a change.\n\n%s' "$summary")" >/dev/null || true
+    gh issue edit "$n" -R "$slug" --remove-label claude-wip >/dev/null || true
+    warn "$name #$n: no commits produced (commented on the issue)"
+  fi
+  git -C "$dir" worktree remove --force "$wt" >/dev/null 2>&1 || true
+  hub_commit "worker($name): issue #$n"
+}
+
+cmd_work() {
+  local target="${1:-}"; [ -n "$target" ] || die "usage: ws work <name|--due>"
+  mkdir -p "$STATE/work"
+  exec 9>"$STATE/work.lock"
+  flock -n 9 || { info "another worker run is in progress"; return 0; }
+  if [ "$target" != "--due" ]; then work_one "$target"; return; fi
+  local n now last iv; now="$(date +%s)"
+  for n in $(project_names); do
+    [ "$(cfg "$n" .worker.auto_issues)" = "true" ] || continue
+    [ "$(jq -r .enabled "$(pjson "$n")")" = "false" ] && continue
+    iv="$(cfg "$n" .worker.interval_minutes)"; iv="${iv:-60}"
+    last="$(cat "$STATE/work/$n.last" 2>/dev/null || echo 0)"
+    [ $(( now - last )) -ge $(( iv * 60 )) ] || continue
+    echo "$now" > "$STATE/work/$n.last"
+    work_one "$n" || warn "$n: worker failed"
+  done
+}
+
+# ---- SessionStart hook: inject Hub context into every session --------------------
+cmd_hook_context() {
+  local input cwd common root name p
+  input="$(cat || true)"
+  cwd="$(jq -r '.cwd // empty' <<<"$input" 2>/dev/null || true)"; cwd="${cwd:-$PWD}"
+  common="$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  [ -n "$common" ] || return 0
+  root="$(dirname "$common")"
+  if [ "$root" = "$HUB" ]; then
+    echo "# VPS Workspace status"; QUIET=1 cmd_status 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; return 0
+  fi
+  name="$(basename "$root")"
+  # worktrees made by the worker live outside ~/projects; map them back by name prefix
+  exists "$name" || name="$(basename "$cwd" | sed -E 's/-[0-9]+$//')"
+  exists "$name" || return 0
+  cmd_context "$name"
+}
+
+cmd_context() {
+  require_project "$1"; local name="$1" p; p="$(pdir "$name")"
+  echo "# Project context: $name"
+  echo "(Injected by VPS Workspace from $p — this is the durable memory for this project.)"
+  echo
+  jq -r '"Repo: \(.github // .repo)  ·  default branch: \(.default_branch)",
+         "Commands:", (.commands | to_entries[] | select(.value != "") | "  - \(.key): \(.value)")' "$p/project.json"
+  echo
+  [ -f "$p/CONTEXT.md" ] && { echo "## Project brief (CONTEXT.md)"; head -n 300 "$p/CONTEXT.md"; echo; }
+  if [ -f "$p/NOTES.md" ]; then echo "## Recent notes (NOTES.md, newest last)"; tail -n 60 "$p/NOTES.md"; echo; fi
+  local f; for f in "$p"/*.md; do
+    case "$(basename "$f")" in CONTEXT.md|NOTES.md) continue;; esac
+    [ -f "$f" ] && echo "Also available: $f"
+  done
+  echo
+  echo "To store new durable knowledge for this project use /remember (writes to $p)."
+}
+
+# ---- maintenance ------------------------------------------------------------------
+cmd_tick() { # every few minutes from ws-tick.timer
+  QUIET=1 cmd_up --all >/dev/null 2>&1 || true
+  QUIET=1 cmd_sync || true
+}
+cmd_boot() { WS_IN_SERVICE=1 ensure_server; QUIET=1 WS_IN_SERVICE=1 cmd_up --all; }
+cmd_self_update() {
+  git -C "$WS_ROOT" pull --ff-only && cmd_apply && ok "updated tooling (restart sessions to pick up changes: ws restart <name>)"
+}
+
+# ------------------------------------------------------------------- dispatch ----
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  help|-h|--help) usage;;
+  init) cmd_init "$@";;
+  apply) cmd_apply;;
+  add) cmd_add "$@";;
+  remove|rm) cmd_remove "$@";;
+  list|ls) cmd_list;;
+  show) cmd_show "$@";;
+  set) cmd_set "$@";;
+  unset) cmd_unset "$@";;
+  set-default) cmd_set_default "$@";;
+  context) cmd_context "$@";;
+  up|start) cmd_up "$@";;
+  down|stop) cmd_down "$@";;
+  restart) cmd_restart "$@";;
+  attach) cmd_attach "$@";;
+  logs) cmd_logs "$@";;
+  status) cmd_status "$@";;
+  doctor) cmd_doctor;;
+  work) cmd_work "$@";;
+  sync) cmd_sync;;
+  hub-remote) cmd_hub_remote "$@";;
+  self-update) cmd_self_update;;
+  _rc-loop) cmd_rc_loop "$@";;
+  _hook-context) cmd_hook_context;;
+  _tick) cmd_tick;;
+  _boot) cmd_boot;;
+  *) usage; die "unknown command: $cmd";;
+esac

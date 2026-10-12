@@ -1,0 +1,16 @@
+[Unit]
+Description=VPS Workspace - Remote Control sessions (tmux server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=WS_IN_SERVICE=1
+ExecStart=__WS_BIN__ _boot
+ExecStop=/usr/bin/tmux -L ws kill-server
+KillMode=control-group
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

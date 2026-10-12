@@ -1,0 +1,6 @@
+[Unit]
+Description=VPS Workspace - watchdog (restart missing sessions) and Hub backup
+
+[Service]
+Type=oneshot
+ExecStart=__WS_BIN__ _tick

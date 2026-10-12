@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "additionalDirectories": [
+      "~/hub"
+    ],
+    "allow": [
+      "Edit(~/hub/**)",
+      "Write(~/hub/**)",
+      "Bash(ws *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(git branch *)",
+      "Bash(git switch *)",
+      "Bash(git checkout *)",
+      "Bash(git fetch *)",
+      "Bash(git pull *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git stash *)",
+      "Bash(git rebase *)",
+      "Bash(git restore *)",
+      "Bash(git rev-parse *)",
+      "Bash(git worktree *)",
+      "Bash(git push -u origin *)",
+      "Bash(git push origin *)",
+      "Bash(git push)",
+      "Bash(gh pr *)",
+      "Bash(gh issue *)",
+      "Bash(gh run *)",
+      "Bash(gh repo view *)",
+      "Bash(gh label *)",
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(pnpm *)",
+      "Bash(yarn *)",
+      "Bash(node *)",
+      "Bash(python3 *)",
+      "Bash(python *)",
+      "Bash(.venv/bin/*)",
+      "Bash(pytest *)",
+      "Bash(pip *)",
+      "Bash(make *)",
+      "Bash(go *)",
+      "Bash(cargo *)",
+      "Bash(composer *)",
+      "Bash(php *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(mkdir *)",
+      "Bash(which *)",
+      "Bash(jq *)",
+      "Bash(rg *)"
+    ],
+    "ask": [
+      "Bash(git push * main)",
+      "Bash(git push * master)",
+      "Bash(gh pr merge *)",
+      "Bash(gh repo delete *)",
+      "Bash(gh release *)",
+      "Bash(rm -rf *)"
+    ],
+    "deny": [
+      "Bash(sudo *)",
+      "Bash(git push --force *)",
+      "Bash(git push -f *)",
+      "Bash(git push * --force)",
+      "Bash(git push * -f)",
+      "Read(~/.claude/.credentials.json)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.ssh/**)",
+      "Read(**/.env)",
+      "Read(**/.env.*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__WS_BIN__ _hook-context",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "env": {
+    "BASH_DEFAULT_TIMEOUT_MS": "300000"
+  }
+}

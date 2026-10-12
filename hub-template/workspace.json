@@ -1,0 +1,23 @@
+{
+  "hub_title": "Workspace Hub",
+  "hub_enabled": true,
+  "hub_capacity": 4,
+  "hub_permission_mode": "acceptEdits",
+  "defaults": {
+    "remote_control": {
+      "spawn": "worktree",
+      "capacity": 4,
+      "permission_mode": "acceptEdits"
+    },
+    "worker": {
+      "auto_issues": false,
+      "label": "claude",
+      "interval_minutes": 60,
+      "max_turns": 80,
+      "timeout_minutes": 60
+    },
+    "pr": {
+      "draft": false
+    }
+  }
+}
