@@ -641,7 +641,8 @@ cmd_tick() { # every few minutes from ws-tick.timer
 }
 cmd_boot() { WS_IN_SERVICE=1 ensure_server; QUIET=1 WS_IN_SERVICE=1 cmd_up --all; }
 cmd_self_update() {
-  git -C "$WS_ROOT" pull --ff-only && cmd_apply && ok "updated tooling (restart sessions to pick up changes: ws restart <name>)"
+  git -C "$WS_ROOT" config core.fileMode false   # the installer chmods files; don't treat that as a change
+  git -C "$WS_ROOT" pull --ff-only --no-rebase && chmod +x "$WS_ROOT/bin/ws" "$WS_ROOT/install.sh" && cmd_apply && ok "updated tooling (restart sessions to pick up changes: ws restart <name>)"
 }
 
 # ------------------------------------------------------------------- dispatch ----

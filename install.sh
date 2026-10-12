@@ -103,6 +103,7 @@ if [ "$SRC_DIR" != "$WS_HOME/vps-workspace" ]; then
   rm -rf "$WS_HOME/vps-workspace"
   mv "$WS_HOME/vps-workspace.new" "$WS_HOME/vps-workspace"
 fi
+[ -d "$WS_HOME/vps-workspace/.git" ] && git -C "$WS_HOME/vps-workspace" config core.fileMode false
 chown -R "$WS_USER:$WS_USER" "$WS_HOME/vps-workspace"
 chmod +x "$WS_HOME/vps-workspace/bin/ws"
 
