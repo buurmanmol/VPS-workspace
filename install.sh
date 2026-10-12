@@ -106,7 +106,16 @@ fi
 chown -R "$WS_USER:$WS_USER" "$WS_HOME/vps-workspace"
 chmod +x "$WS_HOME/vps-workspace/bin/ws"
 
-as_user() { sudo -iu "$WS_USER" env XDG_RUNTIME_DIR="/run/user/$WS_UID" bash -lc "$*"; }
+# Run a snippet as the workspace user. Written to a temp script so that $VARS are
+# expanded by the user's shell (sudo -i would mangle the quoting).
+as_user() {
+  local f rc=0; f="$(mktemp)"
+  { echo 'export PATH="$HOME/.local/bin:$PATH"'; echo 'cd "$HOME"'; printf '%s\n' "$*"; } > "$f"
+  chmod 644 "$f"
+  sudo -u "$WS_USER" -H env XDG_RUNTIME_DIR="/run/user/$WS_UID" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$WS_UID/bus" bash -l "$f" || rc=$?
+  rm -f "$f"; return $rc
+}
 
 say "Installing Claude Code (native installer) for $WS_USER"
 if ! as_user 'command -v claude' >/dev/null 2>&1 && [ ! -x "$WS_HOME/.local/bin/claude" ]; then
