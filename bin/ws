@@ -65,8 +65,9 @@ json_unset() {
   jq --argjson p "$(jq_path "$key")" 'delpaths([$p])' "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
-claude_logged_in() { command -v claude >/dev/null 2>&1 && timeout 20 claude auth status >/dev/null 2>&1; }
-gh_logged_in()     { command -v gh >/dev/null 2>&1 && timeout 20 gh auth status >/dev/null 2>&1; }
+# stdin from /dev/null: a CLI that tries to read the terminal under `timeout` would otherwise stop and hang.
+claude_logged_in() { command -v claude >/dev/null 2>&1 && timeout -k 5 20 claude auth status </dev/null >/dev/null 2>&1; }
+gh_logged_in()     { command -v gh >/dev/null 2>&1 && timeout -k 5 20 gh auth status </dev/null >/dev/null 2>&1; }
 have_systemd_user(){ command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; }
 
 # Mark a directory as trusted for Claude Code so background sessions don't stop
@@ -100,7 +101,7 @@ ensure_server() {
     t new-session -d -s _ws "sleep infinity"; return 0
   fi
   if have_systemd_user && systemctl --user cat ws-up.service >/dev/null 2>&1; then
-    systemctl --user restart ws-up.service
+    timeout 60 systemctl --user restart ws-up.service || warn "ws-up service did not start cleanly (see: systemctl --user status ws-up)"
     for _ in 1 2 3 4 5 6 7 8 9 10; do server_running && return 0; sleep 0.5; done
   fi
   warn "systemd user service unavailable; starting tmux directly (sessions die if this shell's session ends)"
@@ -187,6 +188,7 @@ cmd_init() {
   cmd_apply
 
   echo
+  info "Checking logins (can take a few seconds)…"
   local ready=1
   if claude_logged_in; then ok "Claude is logged in"; else ready=0; warn "Claude is not logged in → run: claude   then  /login"; fi
   if gh_logged_in; then ok "GitHub CLI is logged in"; gh auth setup-git >/dev/null 2>&1 || true
