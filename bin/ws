@@ -7,6 +7,7 @@ WS_ROOT="${WS_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." &&
 HUB="${WS_HUB:-$HOME/hub}"
 PROJECTS="${WS_PROJECTS:-$HOME/projects}"
 STATE="${WS_STATE:-$HOME/.local/state/ws}"
+SECRETS="${WS_SECRETS:-$HOME/secrets}"
 LOGS="$STATE/logs"
 TMUX_SOCK="ws"
 WS_BIN="$WS_ROOT/bin/ws"
@@ -50,6 +51,18 @@ cfg() {
 wcfg() { jq -r "$1 // empty" "$(wsjson)" 2>/dev/null || true; }
 
 checkout_dir() { echo "$PROJECTS/$1"; }
+
+# Secret files (.env etc.) live outside git in ~/secrets/<project>/ and are symlinked into
+# the main checkout and into every worktree (each Remote Control chat / worker run gets one).
+link_secrets() { # name target-dir
+  local src="$SECRETS/$1" dst="$2" f rel
+  [ -d "$src" ] && [ -d "$dst" ] || return 0
+  while IFS= read -r -d '' f; do
+    rel="${f#"$src"/}"
+    mkdir -p "$dst/$(dirname "$rel")"
+    if [ -L "$dst/$rel" ] || [ ! -e "$dst/$rel" ]; then ln -sfn "$f" "$dst/$rel"; fi
+  done < <(find "$src" -type f -print0)
+}
 
 # turn "a.b.c" into a jq path array
 jq_path() { jq -cn --arg p "$1" '$p | split(".") | map(if test("^[0-9]+$") then tonumber else . end)'; }
@@ -122,6 +135,7 @@ ${B}Projects${N}
   ws unset <name> <key>
   ws set-default <key> <value>    change a workspace-wide default (workspace.json .defaults)
   ws context <name>               print the context injected into that project's sessions
+  ws secrets <name>               where to put .env & other secret files (kept out of git, linked into every worktree)
   ws remove <name> [--purge]      stop + archive (and delete checkout with --purge)
 
 ${B}Remote Control sessions${N}  (show up in the Claude app → Code)
@@ -314,6 +328,8 @@ cmd_add() {
   [ -f "$p/CONTEXT.md" ] || sed "s#__NAME__#$name#g; s#__REPO__#${repo_slug:-$url}#g" "$WS_ROOT/templates/project/CONTEXT.md" > "$p/CONTEXT.md"
   [ -f "$p/NOTES.md" ]   || sed "s#__NAME__#$name#g" "$WS_ROOT/templates/project/NOTES.md" > "$p/NOTES.md"
   trust_dir "$dir"
+  mkdir -p "$SECRETS/$name"; chmod 700 "$SECRETS" "$SECRETS/$name"
+  link_secrets "$name" "$dir"
   hub_commit "add project $name"
   ok "registered '$name' (config: $p/project.json)"
   info "  detected commands: $(jq -c '.commands | with_entries(select(.value != ""))' "$p/project.json")"
@@ -358,6 +374,15 @@ cmd_set_default() {
   json_set "$(wsjson)" "defaults.$key" "$*"; hub_commit "defaults: $key=$*"; ok "default $key = $*"
 }
 
+cmd_secrets() {
+  local name="${1:-}"; require_project "$name"
+  mkdir -p "$SECRETS/$name"; chmod 700 "$SECRETS" "$SECRETS/$name"
+  link_secrets "$name" "$(checkout_dir "$name")"
+  info "Secret files for $name: $SECRETS/$name/   (linked into every checkout/worktree as the same relative path)"
+  (cd "$SECRETS/$name" && find . -type f | sed 's#^\./#  - #')
+  info "Add one with e.g.:  nano $SECRETS/$name/.env && chmod 600 $SECRETS/$name/.env && ws secrets $name"
+}
+
 # ---- Remote Control sessions ---------------------------------------------------
 rc_target_dir() { if [ "$1" = hub ]; then echo "$HUB"; else checkout_dir "$1"; fi; }
 
@@ -379,6 +404,7 @@ cmd_up() {
 start_rc() {
   local name="$1" dir; dir="$(rc_target_dir "$name")"
   [ -d "$dir" ] || { warn "$name: checkout missing at $dir"; return 0; }
+  [ "$name" = hub ] || link_secrets "$name" "$dir"
   if session_running "$name"; then [ "${QUIET:-}" = 1 ] || info "$name: already running"; return 0; fi
   mkdir -p "$LOGS"
   t new-session -d -s "rc-$name" -c "$dir" -x 200 -y 50 "$WS_BIN _rc-loop $name"
@@ -523,6 +549,7 @@ work_one() {
   rm -rf "$wt"; git -C "$dir" worktree prune
   git -C "$dir" worktree add -q -B "$branch" "$wt" "origin/$base"
   trust_dir "$wt"
+  link_secrets "$name" "$wt"
   local setup; setup="$(cfg "$name" .commands.setup)"
   [ -n "$setup" ] && (cd "$wt" && bash -lc "$setup" >"$STATE/work/$name-$n.setup.log" 2>&1) || true
 
@@ -613,6 +640,8 @@ cmd_hook_context() {
   # worktrees made by the worker live outside ~/projects; map them back by name prefix
   exists "$name" || name="$(basename "$cwd" | sed -E 's/-[0-9]+$//')"
   exists "$name" || return 0
+  local top; top="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$top" ] && link_secrets "$name" "$top"
   cmd_context "$name"
 }
 
@@ -631,6 +660,10 @@ cmd_context() {
     [ -f "$f" ] && echo "Also available: $f"
   done
   echo
+  if [ -d "$SECRETS/$name" ] && [ -n "$(find "$SECRETS/$name" -type f -print -quit)" ]; then
+    echo "Secret files linked into this checkout (values are private — never print, copy or commit them):"
+    (cd "$SECRETS/$name" && find . -type f | sed 's#^\./#  - #')
+  fi
   echo "To store new durable knowledge for this project use /remember (writes to $p)."
 }
 
@@ -659,6 +692,7 @@ case "$cmd" in
   unset) cmd_unset "$@";;
   set-default) cmd_set_default "$@";;
   context) cmd_context "$@";;
+  secrets) cmd_secrets "$@";;
   up|start) cmd_up "$@";;
   down|stop) cmd_down "$@";;
   restart) cmd_restart "$@";;
